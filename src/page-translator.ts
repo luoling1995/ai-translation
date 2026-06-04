@@ -1,0 +1,498 @@
+// 整页翻译核心模块：文本收集、分批、翻译、MutationObserver 动态翻译
+
+import type { TranslateItem, OriginalTextRecord, TranslateBatchResponse } from './types';
+import { safeSendMessageToBackground, isContextInvalidated } from './messaging';
+import {
+  showProgressUI, updateProgress, showAutoTranslateStatus,
+  finishProgress, markCancelled, showNoContentMessage,
+  removeProgressUI
+} from './progress-ui';
+
+// ==========================================
+// 状态
+// ==========================================
+
+let isPageTranslating = false;
+let isPageTranslated = false;
+let cancelled = false;
+
+// 原文备份，恢复时使用
+let originalTexts: OriginalTextRecord[] = [];
+// 已翻译节点 → 译文映射，防重复和防自身循环
+let translatedNodeTexts = new WeakMap<Node, string>();
+// 原文 → 译文缓存，SPA / 虚拟滚动场景下复用
+const textTranslationCache = new Map<string, string>();
+
+// MutationObserver 相关
+let mutationObserver: MutationObserver | null = null;
+let pendingNewNodes: TranslateItem[] = [];
+let debounceTimer: number | null = null;
+const DEBOUNCE_DELAY = 2000; // 2秒防抖，等新内容加载完再一次性翻译
+let isAutoTranslating = false;
+
+// 分批上限：100k token（模型上下文 200k token，留 100k 给 system prompt + 翻译响应）
+const MAX_BATCH_TOKENS = 100000;
+
+// ==========================================
+// 对外接口
+// ==========================================
+
+/** 获取当前翻译状态 */
+export function getPageState(): { isPageTranslating: boolean; isPageTranslated: boolean } {
+  return { isPageTranslating, isPageTranslated };
+}
+
+/** 执行整页翻译 */
+export async function startPageTranslation(): Promise<void> {
+  if (isPageTranslating) {
+    console.log('[PageTranslator] 整页翻译正在运行中，跳过');
+    return;
+  }
+
+  // 如果已翻译过，先恢复原文再重新翻译
+  if (isPageTranslated) {
+    restoreOriginalText();
+  }
+
+  isPageTranslating = true;
+  cancelled = false;
+
+  // 1. 收集所有待翻译文本节点
+  const items = collectTextNodesFromElement(document.body);
+  console.log('[PageTranslator] 收集到', items.length, '个待翻译文本节点');
+
+  if (items.length === 0) {
+    console.log('[PageTranslator] 页面无需翻译，全部被过滤');
+    showNoContentMessage();
+    isPageTranslating = false;
+    return;
+  }
+
+  // 2. 优先从缓存应用，剩余的走 API
+  originalTexts = [];
+  const itemsToTranslate: TranslateItem[] = [];
+
+  for (const item of items) {
+    saveOriginalText(item.textNode, item.originalText);
+    const cached = textTranslationCache.get(item.originalText);
+    if (cached) {
+      applyCachedTranslation(item.textNode, item.originalText, cached);
+    } else {
+      itemsToTranslate.push(item);
+    }
+  }
+
+  const cacheHitCount = items.length - itemsToTranslate.length;
+  if (cacheHitCount > 0) {
+    console.log('[PageTranslator] 缓存命中', cacheHitCount, '个，需 API 翻译', itemsToTranslate.length, '个');
+  }
+
+  // 全部命中缓存
+  if (itemsToTranslate.length === 0) {
+    console.log('[PageTranslator] 全部命中缓存，无需调用 API');
+    showProgressUI({
+      onCancel: () => {},
+      onRestore: () => restoreOriginalText()
+    });
+    finishProgress(false);
+    updateProgress(1, 1, '✓ 翻译完成（已使用本地缓存）');
+    isPageTranslating = false;
+    isPageTranslated = true;
+    startMutationObserver();
+    return;
+  }
+
+  // 3. 分批
+  const batches = splitIntoBatches(itemsToTranslate);
+  const total = batches.length;
+  console.log(`[PageTranslator] 分为 ${total} 批，共 ${itemsToTranslate.length} 个文本节点`);
+
+  // 4. 显示进度条
+  showProgressUI({
+    onCancel: () => { cancelled = true; },
+    onRestore: () => restoreOriginalText()
+  });
+  updateProgress(0, total);
+
+  if (total > 50) {
+    updateProgress(0, total, `正在翻译... (0/${total}) - 页面较长，预计耗时约一分钟`);
+  }
+
+  // 5. 逐批翻译
+  let hasError = false;
+  for (let i = 0; i < total; i++) {
+    if (cancelled || isContextInvalidated()) break;
+
+    updateProgress(i + 1, total);
+
+    const batch = batches[i];
+    const texts = batch.map(item => item.originalText);
+
+    try {
+      const response: TranslateBatchResponse = await safeSendMessageToBackground({
+        action: 'translateBatch',
+        texts,
+        batchIndex: i,
+        totalBatches: total
+      });
+
+      if (cancelled || isContextInvalidated()) break;
+
+      if (response.success) {
+        const translated = response.translatedTexts;
+        for (let j = 0; j < batch.length; j++) {
+          if (translated[j] !== undefined) {
+            batch[j].textNode.textContent = translated[j];
+            translatedNodeTexts.set(batch[j].textNode, translated[j]);
+            textTranslationCache.set(batch[j].originalText, translated[j]);
+          }
+        }
+        console.log(`[PageTranslator] 批次 ${i + 1}/${total} 翻译成功，${batch.length} 段`);
+      } else {
+        hasError = true;
+        console.warn(`[PageTranslator] 批次 ${i + 1} 翻译返回失败:`, response.error);
+      }
+    } catch (e) {
+      hasError = true;
+      console.error(`[PageTranslator] 批次 ${i + 1} 翻译异常:`, e);
+      if (isContextInvalidated()) break;
+    }
+  }
+
+  isPageTranslating = false;
+
+  if (cancelled) {
+    console.log('[PageTranslator] 翻译已被用户取消');
+    isPageTranslated = true;
+    markCancelled();
+    return;
+  }
+
+  isPageTranslated = true;
+  console.log('[PageTranslator] 整页翻译完成', hasError ? '（部分批次失败）' : '');
+  finishProgress(hasError);
+  startMutationObserver();
+}
+
+/** 恢复网页原文 */
+export function restoreOriginalText(): void {
+  console.log('[PageTranslator] 恢复原文，共', originalTexts.length, '个节点');
+  stopMutationObserver();
+
+  for (const item of originalTexts) {
+    item.node.textContent = item.text;
+  }
+
+  originalTexts = [];
+  translatedNodeTexts = new WeakMap();
+  isPageTranslated = false;
+  isPageTranslating = false;
+  cancelled = false;
+
+  removeProgressUI();
+}
+
+/** 停止 MutationObserver（供 messaging 模块在上下文失效时调用） */
+export function stopMutationObserver(): void {
+  if (mutationObserver) {
+    console.log('[PageTranslator] 停止 MutationObserver');
+    mutationObserver.disconnect();
+    mutationObserver = null;
+  }
+  if (debounceTimer !== null) {
+    clearTimeout(debounceTimer);
+    debounceTimer = null;
+  }
+  pendingNewNodes = [];
+  translatedNodeTexts = new WeakMap();
+  isAutoTranslating = false;
+}
+
+// ==========================================
+// 文本节点收集
+// ==========================================
+
+const EXCLUDED_TAGS = new Set([
+  'script', 'style', 'code', 'pre', 'textarea', 'input', 'select', 'option',
+  'noscript', 'iframe', 'svg', 'math', 'canvas', 'video', 'audio', 'img'
+]);
+
+/**
+ * 收集指定节点下所有符合条件的待翻译文本节点。
+ * skipVisibilityCheck: MutationObserver 回调中新增节点可能尚未完成布局，跳过可见性检查。
+ */
+export function collectTextNodesFromElement(element: Node, skipVisibilityCheck = false): TranslateItem[] {
+  const items: TranslateItem[] = [];
+
+  function walk(node: Node): void {
+    if (node.nodeType === Node.ELEMENT_NODE) {
+      const el = node as HTMLElement;
+      const tagName = el.tagName.toLowerCase();
+
+      if (EXCLUDED_TAGS.has(tagName)) return;
+      if (el.id?.startsWith('ai-translate-')) return;
+
+      if (!skipVisibilityCheck) {
+        const style = window.getComputedStyle(el);
+        if (style.display === 'none' || style.visibility === 'hidden') return;
+      }
+
+      if (el.isContentEditable) return;
+    }
+
+    if (node.nodeType === Node.TEXT_NODE) {
+      const text = node.textContent || '';
+      const trimmed = text.trim();
+
+      if (trimmed === '') return;
+      if (/^\d+$/.test(trimmed)) return;
+      if (/^https?:\/\//.test(trimmed)) return;
+      if (trimmed.length <= 1) return;
+
+      const chineseChars = text.match(/[\u4e00-\u9fff]/g);
+      const chineseCount = chineseChars ? chineseChars.length : 0;
+      if (chineseCount / text.length > 0.5) return;
+
+      const parent = node.parentNode;
+      const parentTag = parent ? (parent as HTMLElement).tagName || '' : '';
+
+      items.push({ textNode: node, originalText: text, parentTag });
+      return;
+    }
+
+    let child = node.firstChild;
+    while (child) {
+      walk(child);
+      child = child.nextSibling;
+    }
+  }
+
+  walk(element);
+  return items;
+}
+
+/**
+ * 估算文本的 token 数。
+ * 启发式规则：ASCII 约 4 字符 = 1 token，CJK 约 1 字符 = 1.5 token，其他 1:1。
+ */
+function estimateTokens(text: string): number {
+  let tokens = 0;
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    if (code <= 0x7F) {
+      // ASCII（英文、数字、标点）
+      tokens += 0.25;
+    } else if (
+      (code >= 0x4E00 && code <= 0x9FFF) ||   // CJK 统一汉字
+      (code >= 0x3040 && code <= 0x30FF) ||   // 日文平假名 + 片假名
+      (code >= 0xAC00 && code <= 0xD7AF)      // 韩文音节
+    ) {
+      tokens += 1.5;
+    } else {
+      tokens += 1;
+    }
+  }
+  return Math.ceil(tokens);
+}
+
+/** 按 token 估算值分批，单批上限 MAX_BATCH_TOKENS */
+function splitIntoBatches(items: TranslateItem[]): TranslateItem[][] {
+  if (items.length === 0) return [];
+
+  const batches: TranslateItem[][] = [];
+  let currentBatch: TranslateItem[] = [];
+  let currentTokens = 0;
+
+  for (const item of items) {
+    const itemTokens = estimateTokens(item.originalText);
+
+    if (currentBatch.length > 0 && currentTokens + itemTokens > MAX_BATCH_TOKENS) {
+      batches.push(currentBatch);
+      currentBatch = [];
+      currentTokens = 0;
+    }
+
+    currentBatch.push(item);
+    currentTokens += itemTokens;
+  }
+
+  if (currentBatch.length > 0) {
+    batches.push(currentBatch);
+  }
+
+  return batches;
+}
+
+// ==========================================
+// 辅助函数
+// ==========================================
+
+/** 保存/更新原始文本，防止复用节点时恢复错误的内容 */
+function saveOriginalText(node: Node, text: string): void {
+  const record = originalTexts.find(r => r.node === node);
+  if (record) {
+    record.text = text;
+  } else {
+    originalTexts.push({ node, text });
+  }
+}
+
+/** 异步应用缓存译文，防止在 MutationObserver 回调中同步修改 DOM 干扰 React 协调器 */
+function applyCachedTranslation(node: Node, originalText: string, cachedText: string): void {
+  setTimeout(() => {
+    saveOriginalText(node, originalText);
+    node.textContent = cachedText;
+    translatedNodeTexts.set(node, cachedText);
+  }, 0);
+}
+
+/** 释放已移除节点的强引用，防止内存泄漏 */
+function cleanOriginalTextsForRemovedNode(removedNode: Node): void {
+  if (originalTexts.length === 0) return;
+
+  const textNodes = new Set<Node>();
+  function walk(node: Node): void {
+    if (node.nodeType === Node.TEXT_NODE) {
+      textNodes.add(node);
+      return;
+    }
+    let child = node.firstChild;
+    while (child) {
+      walk(child);
+      child = child.nextSibling;
+    }
+  }
+  walk(removedNode);
+
+  if (textNodes.size > 0) {
+    originalTexts = originalTexts.filter(record => !textNodes.has(record.node));
+  }
+}
+
+// ==========================================
+// MutationObserver 动态内容自动翻译
+// ==========================================
+
+function startMutationObserver(): void {
+  if (mutationObserver) {
+    stopMutationObserver();
+  }
+  console.log('[PageTranslator] 启动 MutationObserver 监听动态内容');
+
+  mutationObserver = new MutationObserver((mutations: MutationRecord[]) => {
+    for (const mutation of mutations) {
+      if (mutation.type !== 'childList') continue;
+
+      // 处理节点移除，释放内存
+      for (const removedNode of mutation.removedNodes) {
+        cleanOriginalTextsForRemovedNode(removedNode);
+      }
+
+      // 处理新增节点
+      for (const addedNode of mutation.addedNodes) {
+        if (addedNode.nodeType !== Node.ELEMENT_NODE && addedNode.nodeType !== Node.TEXT_NODE) continue;
+        if (addedNode instanceof HTMLElement && addedNode.id?.startsWith('ai-translate-')) continue;
+
+        const newItems = collectTextNodesFromElement(addedNode, true);
+        const filteredItems = newItems.filter(item => {
+          // 缓存命中直接应用，不走 API
+          const cached = textTranslationCache.get(item.originalText);
+          if (cached) {
+            applyCachedTranslation(item.textNode, item.originalText, cached);
+            return false;
+          }
+          // 已翻译的节点跳过
+          const lastTranslated = translatedNodeTexts.get(item.textNode);
+          if (lastTranslated !== undefined && item.textNode.textContent === lastTranslated) {
+            return false;
+          }
+          return true;
+        });
+
+        for (const item of filteredItems) {
+          if (!pendingNewNodes.some(p => p.textNode === item.textNode)) {
+            pendingNewNodes.push(item);
+          }
+        }
+      }
+    }
+
+    // 有新内容且当前无翻译任务运行、无防抖定时器，则启动防抖
+    if (pendingNewNodes.length > 0 && debounceTimer === null && !isAutoTranslating) {
+      console.log('[PageTranslator] 检测到', pendingNewNodes.length, '个新增待翻译节点，等待防抖...');
+      debounceTimer = window.setTimeout(() => {
+        debounceTimer = null;
+        void flushPendingTranslation();
+      }, DEBOUNCE_DELAY);
+    }
+  });
+
+  mutationObserver.observe(document.body, {
+    childList: true,
+    subtree: true
+    // 不监听 characterData，避免自己替换文本时触发循环
+  });
+}
+
+async function flushPendingTranslation(): Promise<void> {
+  if (pendingNewNodes.length === 0 || isAutoTranslating) return;
+
+  isAutoTranslating = true;
+
+  try {
+    const itemsToTranslate = [...pendingNewNodes];
+    pendingNewNodes = [];
+
+    console.log('[PageTranslator] 自动翻译新增内容:', itemsToTranslate.length, '个文本节点');
+
+    // 显示自动翻译状态
+    showAutoTranslateStatus(itemsToTranslate.length);
+
+    const batches = splitIntoBatches(itemsToTranslate);
+    for (let i = 0; i < batches.length; i++) {
+      const batch = batches[i];
+      if (!mutationObserver || isContextInvalidated()) break;
+
+      try {
+        const texts = batch.map(item => item.originalText);
+        const response: TranslateBatchResponse = await safeSendMessageToBackground({
+          action: 'translateBatch',
+          texts,
+          batchIndex: i,
+          totalBatches: batches.length
+        });
+
+        if (!mutationObserver || isContextInvalidated()) break;
+
+        if (response.success) {
+          for (let j = 0; j < batch.length; j++) {
+            if (typeof response.translatedTexts[j] === 'string') {
+              saveOriginalText(batch[j].textNode, batch[j].originalText);
+              batch[j].textNode.textContent = response.translatedTexts[j];
+              translatedNodeTexts.set(batch[j].textNode, response.translatedTexts[j]);
+              textTranslationCache.set(batch[j].originalText, response.translatedTexts[j]);
+            }
+          }
+          console.log('[PageTranslator] 自动翻译批次完成，', batch.length, '段');
+        } else {
+          console.warn('[PageTranslator] 自动翻译失败:', response.error);
+        }
+      } catch (e) {
+        console.warn('[PageTranslator] 动态翻译单批失败:', e);
+        if (isContextInvalidated()) break;
+      }
+    }
+  } finally {
+    isAutoTranslating = false;
+    // 恢复进度条为完成状态
+    finishProgress(false);
+  }
+
+  // 翻译期间可能又积累了新内容，通过防抖继续处理
+  if (pendingNewNodes.length > 0 && debounceTimer === null) {
+    debounceTimer = window.setTimeout(() => {
+      debounceTimer = null;
+      void flushPendingTranslation();
+    }, DEBOUNCE_DELAY);
+  }
+}

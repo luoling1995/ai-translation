@@ -1,0 +1,17 @@
+{
+  "name": "ai-translation-gemini",
+  "version": "1.0.0",
+  "description": "Chrome 大模型翻译插件",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "npm run typecheck && npm run build:background && npm run build:content && npm run build:popup",
+    "build:background": "esbuild src/background.ts --bundle --format=iife --target=chrome114 --outfile=dist/background.js --sourcemap",
+    "build:content": "esbuild src/content.ts --bundle --format=iife --target=chrome114 --outfile=dist/content.js --sourcemap",
+    "build:popup": "esbuild src/popup.ts --bundle --format=iife --target=chrome114 --outfile=dist/popup.js --sourcemap"
+  },
+  "devDependencies": {
+    "@types/chrome": "latest",
+    "esbuild": "latest",
+    "typescript": "latest"
+  }
+}
