@@ -142,7 +142,8 @@ function renderPopupDOM(
   style.textContent = `
     ${COMMON_STYLE}
     .popup-card {
-      width: 350px; min-width: 300px; max-width: 500px; max-height: 400px;
+      width: 350px; min-width: 300px; max-width: 500px;
+      max-height: var(--popup-max-height, 400px);
       border-radius: 12px; background-color: #ffffff;
       box-shadow: 0 20px 60px rgba(0,0,0,0.15), 0 0 0 1px rgba(0,0,0,0.05);
       border: 1px solid #E5E7EB;
@@ -152,7 +153,9 @@ function renderPopupDOM(
       padding: 10px 16px; background-color: #ffffff;
       border-bottom: 1px solid #E5E7EB;
       display: flex; justify-content: space-between; align-items: center;
+      cursor: grab; user-select: none;
     }
+    .header.dragging { cursor: grabbing; }
     .title { font-weight: 600; font-size: 13px; color: #6B7280; margin: 0; }
     .close-btn {
       background: none; border: none; cursor: pointer; color: #9CA3AF;
@@ -167,7 +170,7 @@ function renderPopupDOM(
     }
     .translation-box {
       padding: 16px; font-size: 14px; background-color: #ffffff;
-      min-height: 80px; display: flex; flex-direction: column; justify-content: center;
+      display: flex; flex-direction: column; justify-content: flex-start;
     }
     .translation-text {
       margin: 0; white-space: pre-wrap; word-break: break-word; color: #1F2937;
@@ -205,6 +208,44 @@ function renderPopupDOM(
   closeBtn.addEventListener('click', (e) => { e.stopPropagation(); cleanupUI(); });
   header.appendChild(closeBtn);
   card.appendChild(header);
+
+  // 拖拽逻辑：在 header 上按下鼠标后，监听 document 的 mousemove/mouseup
+  header.addEventListener('mousedown', (e: MouseEvent) => {
+    // 点关闭按钮时不触发拖拽
+    if ((e.target as HTMLElement).closest('.close-btn')) return;
+    e.preventDefault();
+
+    const hostEl = document.getElementById(POPUP_HOST_ID);
+    if (!hostEl) return;
+
+    const startX = e.clientX;
+    const startY = e.clientY;
+    const startLeft = parseInt(hostEl.style.left, 10) || 0;
+    const startTop  = parseInt(hostEl.style.top, 10)  || 0;
+    const popupMaxHeight = 400;
+    const padding = 8;
+
+    header.classList.add('dragging');
+
+    const onMouseMove = (ev: MouseEvent) => {
+      const newLeft = Math.max(padding, startLeft + ev.clientX - startX);
+      const newTop  = Math.max(padding, startTop  + ev.clientY - startY);
+      hostEl.style.left = `${newLeft}px`;
+      hostEl.style.top  = `${newTop}px`;
+      // 拖拽后重新限制高度，确保不超出视口底部
+      const cardMaxHeight = Math.min(popupMaxHeight, window.innerHeight - newTop - padding);
+      hostEl.style.setProperty('--popup-max-height', `${cardMaxHeight}px`);
+    };
+
+    const onMouseUp = () => {
+      header.classList.remove('dragging');
+      document.removeEventListener('mousemove', onMouseMove);
+      document.removeEventListener('mouseup', onMouseUp);
+    };
+
+    document.addEventListener('mousemove', onMouseMove);
+    document.addEventListener('mouseup', onMouseUp);
+  });
 
   const body = document.createElement('div');
   body.className = 'content-body';
@@ -258,6 +299,8 @@ function showTranslationPopup(
     let left = 0;
     let top = 0;
     const popupWidth = 350;
+    const popupMaxHeight = 400;
+    const padding = 8;
 
     if (isCenter || !rect) {
       left = window.innerWidth / 2 - popupWidth / 2;
@@ -266,16 +309,28 @@ function showTranslationPopup(
       left = rect.left;
       top = rect.bottom + 8;
 
-      const padding = 8;
       const maxLeft = window.innerWidth - popupWidth - padding;
-      const maxTop = window.innerHeight - 200 - padding;
 
       if (left > maxLeft) left = window.innerWidth - popupWidth - padding;
-      if (top > maxTop) top = rect.top - 200 - padding;
+
+      // 下方可用空间
+      const spaceBelow = window.innerHeight - top - padding;
+      // 上方可用空间
+      const spaceAbove = rect.top - padding;
+
+      if (spaceBelow < popupMaxHeight && spaceAbove > spaceBelow) {
+        // 空间不足且上方更宽裕，弹窗显示在选中文本上方
+        top = rect.top - Math.min(popupMaxHeight, spaceAbove) - 8;
+      }
 
       left = Math.max(padding, left);
       top = Math.max(padding, top);
     }
+
+    // 计算实际可用高度并通过 CSS 变量传给 card
+    const availableHeight = window.innerHeight - top - padding;
+    const cardMaxHeight = Math.min(popupMaxHeight, availableHeight);
+    container.style.setProperty('--popup-max-height', `${cardMaxHeight}px`);
 
     container.style.left = `${left}px`;
     container.style.top = `${top}px`;
