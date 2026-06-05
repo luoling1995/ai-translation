@@ -18,6 +18,9 @@ let cancelled = false;
 
 // 原文备份，恢复时使用
 let originalTexts: OriginalTextRecord[] = [];
+// 被修改了 height 的容器备份，恢复时还原
+interface OverflowFix { el: HTMLElement; origHeight: string; origMinHeight: string; }
+let overflowFixes: OverflowFix[] = [];
 // 已翻译节点 → 译文映射，防重复和防自身循环
 let translatedNodeTexts = new WeakMap<Node, string>();
 // 原文 → 译文缓存，SPA / 虚拟滚动场景下复用
@@ -169,6 +172,7 @@ export async function startPageTranslation(): Promise<void> {
   }
 
   isPageTranslated = true;
+  fixOverflowContainers();
   console.log('[PageTranslator] 整页翻译完成', hasError ? '（部分批次失败）' : '');
   finishProgress(hasError);
   startMutationObserver();
@@ -182,6 +186,13 @@ export function restoreOriginalText(): void {
   for (const item of originalTexts) {
     item.node.textContent = item.text;
   }
+
+  // 还原被修改的容器 height 样式
+  for (const fix of overflowFixes) {
+    fix.el.style.height = fix.origHeight;
+    fix.el.style.minHeight = fix.origMinHeight;
+  }
+  overflowFixes = [];
 
   originalTexts = [];
   translatedNodeTexts = new WeakMap();
@@ -321,6 +332,54 @@ function splitIntoBatches(items: TranslateItem[]): TranslateItem[][] {
   }
 
   return batches;
+}
+
+// ==========================================
+// 容器溢出修复
+// ==========================================
+
+/**
+ * 翻译完成后扫描所有已翻译文本节点的祖先元素。
+ * 若某个祖先有 overflow:hidden 且 height 是固定像素值（非 auto/''），
+ * 则将 height 改为 min-height，防止中文译文行数更多时被裁剪。
+ * 最多向上追溯 8 层，避免误改根容器。
+ */
+function fixOverflowContainers(): void {
+  if (originalTexts.length === 0) return;
+
+  const visited = new Set<HTMLElement>();
+
+  for (const record of originalTexts) {
+    let node: Node | null = record.node.parentNode;
+    let depth = 0;
+    while (node && depth < 8) {
+      if (node.nodeType !== Node.ELEMENT_NODE) { node = node.parentNode; depth++; continue; }
+      const el = node as HTMLElement;
+      if (visited.has(el)) { node = node.parentNode; depth++; continue; }
+      visited.add(el);
+
+      const style = window.getComputedStyle(el);
+      // 仅处理 overflow:hidden 且 height 被显式固定（不是 auto）的元素
+      if (style.overflow === 'hidden' || style.overflowY === 'hidden') {
+        const inlineHeight = el.style.height;
+        const computedHeight = style.height;
+        // 只修改有固定像素高度的元素（排除 auto、0px、空字符串）
+        if (computedHeight && computedHeight !== 'auto' && computedHeight !== '0px') {
+          overflowFixes.push({
+            el,
+            origHeight: inlineHeight,
+            origMinHeight: el.style.minHeight
+          });
+          // 用 min-height 替代固定 height，内容超出时容器自动撑高
+          el.style.height = 'auto';
+          el.style.minHeight = computedHeight;
+        }
+      }
+      node = node.parentNode;
+      depth++;
+    }
+  }
+  console.log('[PageTranslator] 修复溢出容器', overflowFixes.length, '个');
 }
 
 // ==========================================
