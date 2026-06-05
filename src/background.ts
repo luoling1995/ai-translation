@@ -145,6 +145,13 @@ async function callTranslateAPI(text: string, isMultiSegment: boolean = false): 
       return { success: false, error: '翻译服务返回了空结果，请重试' };
     }
 
+    // 检测输出是否被截断（超出模型 max output token 限制）
+    const finishReason = data.choices[0].finish_reason;
+    if (finishReason === 'length') {
+      console.warn('[Background] 模型输出因 token 限制被截断（finish_reason=length），本批条目过多');
+      return { success: false, error: '翻译输出被截断（批次过大），已自动重试' };
+    }
+
     let translatedText = data.choices[0].message.content;
     // 过滤可能包含在译文中的大模型思考过程 <think>...</think>
     translatedText = translatedText.replace(/<think>[\s\S]*?<\/think>\n?/g, '').trim();
@@ -188,9 +195,11 @@ async function translateBatch(texts: string[]): Promise<TranslateBatchResponse> 
       try {
         translatedTexts = JSON.parse(match[0]);
       } catch {
+        console.warn('[Background] JSON 数组提取后仍 parse 失败，rawText 片段:', rawText.slice(0, 500));
         return { success: false, error: '翻译服务返回了无效的响应' };
       }
     } else {
+      console.warn('[Background] 响应中未找到 JSON 数组，rawText 片段:', rawText.slice(0, 500));
       return { success: false, error: '翻译服务返回了无效的响应' };
     }
   }

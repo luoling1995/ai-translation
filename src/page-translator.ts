@@ -121,7 +121,8 @@ export async function startPageTranslation(): Promise<void> {
     updateProgress(0, total, `正在翻译... (0/${total}) - 页面较长，预计耗时约一分钟`);
   }
 
-  // 5. 逐批翻译
+  // 5. 逐批翻译（每批失败最多重试 2 次，共 3 次尝试）
+  const MAX_RETRY = 2;
   let hasError = false;
   for (let i = 0; i < total; i++) {
     if (cancelled || isContextInvalidated()) break;
@@ -131,34 +132,54 @@ export async function startPageTranslation(): Promise<void> {
     const batch = batches[i];
     const texts = batch.map(item => item.originalText);
 
-    try {
-      const response: TranslateBatchResponse = await safeSendMessageToBackground({
-        action: 'translateBatch',
-        texts,
-        batchIndex: i,
-        totalBatches: total
-      });
-
+    let batchSuccess = false;
+    for (let attempt = 0; attempt <= MAX_RETRY; attempt++) {
       if (cancelled || isContextInvalidated()) break;
 
-      if (response.success) {
-        const translated = response.translatedTexts;
-        for (let j = 0; j < batch.length; j++) {
-          if (translated[j] !== undefined) {
-            batch[j].textNode.textContent = translated[j];
-            translatedNodeTexts.set(batch[j].textNode, translated[j]);
-            textTranslationCache.set(batch[j].originalText, translated[j]);
-          }
-        }
-        console.log(`[PageTranslator] 批次 ${i + 1}/${total} 翻译成功，${batch.length} 段`);
-      } else {
-        hasError = true;
-        console.warn(`[PageTranslator] 批次 ${i + 1} 翻译返回失败:`, response.error);
+      if (attempt > 0) {
+        console.log(`[PageTranslator] 批次 ${i + 1} 第 ${attempt} 次重试...`);
+        updateProgress(i + 1, total, `⚠️ 批次 ${i + 1} 响应异常，正在重试（第 ${attempt}/${MAX_RETRY} 次）...`);
+        await new Promise(resolve => setTimeout(resolve, 1000));
       }
-    } catch (e) {
+
+      try {
+        const response: TranslateBatchResponse = await safeSendMessageToBackground({
+          action: 'translateBatch',
+          texts,
+          batchIndex: i,
+          totalBatches: total
+        });
+
+        if (cancelled || isContextInvalidated()) break;
+
+        if (response.success) {
+          const translated = response.translatedTexts;
+          for (let j = 0; j < batch.length; j++) {
+            if (translated[j] !== undefined) {
+              batch[j].textNode.textContent = translated[j];
+              translatedNodeTexts.set(batch[j].textNode, translated[j]);
+              textTranslationCache.set(batch[j].originalText, translated[j]);
+            }
+          }
+          if (attempt > 0) {
+            // 重试成功，把进度条恢复为正常文案
+            updateProgress(i + 1, total);
+          }
+          console.log(`[PageTranslator] 批次 ${i + 1}/${total} 翻译成功，${batch.length} 段${attempt > 0 ? `（第 ${attempt + 1} 次尝试）` : ''}`);
+          batchSuccess = true;
+          break;
+        } else {
+          console.warn(`[PageTranslator] 批次 ${i + 1} 第 ${attempt + 1} 次尝试失败:`, response.error);
+        }
+      } catch (e) {
+        console.error(`[PageTranslator] 批次 ${i + 1} 第 ${attempt + 1} 次尝试异常:`, e);
+        if (isContextInvalidated()) break;
+      }
+    }
+
+    if (!batchSuccess && !cancelled && !isContextInvalidated()) {
       hasError = true;
-      console.error(`[PageTranslator] 批次 ${i + 1} 翻译异常:`, e);
-      if (isContextInvalidated()) break;
+      console.warn(`[PageTranslator] 批次 ${i + 1} 重试 ${MAX_RETRY} 次后仍失败，跳过`);
     }
   }
 
