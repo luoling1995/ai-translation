@@ -1,6 +1,6 @@
 # 整页翻译与动态内容翻译
 
-> 版本：v1.3 | 日期：2026-06-03
+> 版本：v1.4 | 日期：2026-06-06
 
 > 返回总览：[chrome-translate-plugin-spec.md](../chrome-translate-plugin-spec.md)
 >
@@ -50,27 +50,39 @@ noscript, iframe, svg, math, canvas, video, audio, img
 
 #### 分批策略
 
-将收集到的文本节点分批，每批满足以下条件：
-- 每批的文本总字符数 ≤ 3000 字符
-- 每批的文本段落数 ≤ 20 段
-- 以上两个条件任一达到则切换到下一批
+将收集到的文本节点按 **token 估算值**分批，每批的估算 token 总数 ≤ 5000。
+
+估算规则（启发式，不需要实际 tokenizer）：
+- ASCII 字符（英文、数字、标点）：4 字符 ≈ 1 token
+- CJK 字符（汉、日、韩）：1 字符 ≈ 1.5 token
+- 其他 Unicode：1 字符 = 1 token
+
+取 5000 token 上限（模型最大输入/输出各 16k，按最坏情况输入=输出留 ~34% 余量），彻底避免 `finish_reason=length` 截断。**不限制每批的段落数上限**。
 
 #### 翻译执行流程
 
 ```
 1. 收集所有待翻译文本节点 → 得到 items[]
-2. 按分批策略将 items 分为 batches[]
-3. 在页面顶部插入进度条 UI（固定定位，z-index: 2147483647）
-4. 依次（顺序，非并发）处理每个 batch：
-   a. 将 batch 内所有文本作为 JSON 字符串数组发送到 Service Worker
-   b. Service Worker 调用翻译 API，并要求模型只返回 JSON 字符串数组
-   c. Service Worker 解析 JSON，得到 translatedTexts[]
-   d. 如果解析成功且数组长度匹配，逐一将翻译结果写回对应的 textNode.textContent
-   e. 如果解析失败或数组长度不匹配，该批次保持原文并标记为失败
-   f. 更新进度条（已完成批次 / 总批次）
-5. 全部完成 → 进度条文字改为"翻译完成"，显示"恢复原文"按钮
-6. 启动 MutationObserver 监听新增 DOM 内容（见 §2.3.1）
+2. 优先查询内存翻译缓存（textTranslationCache）：
+   - 命中缓存的节点：异步（setTimeout 0ms）写入译文，跳过 API
+   - 未命中的节点：进入 itemsToTranslate[]
+3. 按分批策略将 itemsToTranslate 分为 batches[]
+4. 在页面顶部插入进度条 UI（固定定位，z-index: 2147483647）
+5. 并发（CONCURRENCY_LIMIT = 3）处理所有批次，每批最多重试 2 次（共 3 次尝试）：
+   a. 用 ⟪N#⟫ 编号分隔符拼接所有文本，发送到 Service Worker
+   b. Service Worker 调用翻译 API，模型按编号保留分隔符原样输出
+   c. Service Worker 按 ⟪N#⟫ 拆分，按编号精确回填对应 textNode，防止数组错位
+   d. 模型丢失的项收集到 missedItems[]，批次本身标记为成功
+   e. 更新进度条（已完成批次 / 总批次）
+6. 所有批次完成后，对 missedItems 统一发起一次补翻译请求
+7. 全部完成 → 执行 fixOverflowContainers() 修复 overflow:hidden 被截断的容器
+8. 进度条文字改为"翻译完成"，显示"恢复原文"按钮
+9. 启动 MutationObserver 监听新增 DOM 内容（见 §2.3.1）
 ```
+
+**翻译缓存**：每次翻译成功后，将原文→译文写入模块级 `textTranslationCache`（`Map<string, string>`）。整页翻译启动时优先命中缓存；MutationObserver 动态翻译也先查缓存，命中则直接应用，减少 API 调用。页面刷新后缓存清空（内存生命周期与 Content Script 相同）。
+
+**溢出容器修复**：翻译完成后扫描所有已翻译文本节点的祖先（最多 8 层），若某祖先有 `overflow:hidden` 且 `height` 为固定像素值，则将 `height` 改为 `auto`、补设 `min-height`，防止中文译文行数更多时被裁剪。恢复原文时同步还原。
 
 #### 进度条 UI
 
@@ -110,7 +122,7 @@ noscript, iframe, svg, math, canvas, video, audio, img
 | API 某一批次返回错误 | 该批次所有文本保持原文，继续处理下一批次。进度条不中断，但在完成后显示"翻译完成（部分段落翻译失败）" |
 | 整页翻译进行中，用户触发划词翻译 | 允许，两者互不干扰。划词翻译使用独立的浮窗 |
 | 已经完成整页翻译，再次触发整页翻译 | 先恢复原文（同时停止 MutationObserver），再重新执行整页翻译 |
-| 页面非常长，收集到 1000+ 个文本节点 | 正常分批处理，无上限。但如果总批次 > 50，在进度条旁边显示预计耗时提示 |
+| 页面非常长，收集到 1000+ 个文本节点 | 正常分批处理，无批次上限。若总批次 > 50，进度条显示"页面较长，预计耗时约一分钟"提示 |
 
 ### 2.3.1 动态内容自动翻译（MutationObserver）
 
@@ -129,9 +141,9 @@ noscript, iframe, svg, math, canvas, video, audio, img
 let mutationObserver: MutationObserver | null = null;
 let pendingNewNodes: TranslateItem[] = [];  // 攒批用的缓冲区
 let debounceTimer: number | null = null;
-const DEBOUNCE_DELAY = 500; // 500ms 防抖
-let translatedNodes = new WeakSet<Node>();   // 已翻译节点记录，防重复
-let isAutoTranslating = false;               // 防止并发翻译
+const DEBOUNCE_DELAY = 2000; // 2000ms 防抖，等新内容加载完再一次性翻译
+let translatedNodeTexts = new WeakMap<Node, string>(); // 已翻译节点→译文映射，防重复
+let isAutoTranslating = false;                         // 防止并发翻译
 
 function startMutationObserver(): void {
   mutationObserver = new MutationObserver((mutations: MutationRecord[]) => {
@@ -146,10 +158,20 @@ function startMutationObserver(): void {
           continue;
         }
         // 收集新增节点中的待翻译文本
-        const newItems = collectTextNodesFromElement(addedNode);
-        // 过滤掉已翻译的节点
-        const filteredItems = newItems.filter(item => !translatedNodes.has(item.textNode));
-        pendingNewNodes.push(...filteredItems);
+        const newItems = collectTextNodesFromElement(addedNode, true); // skipVisibilityCheck=true
+        const filteredItems = newItems.filter(item => {
+          // 缓存命中直接应用
+          const cached = textTranslationCache.get(item.originalText);
+          if (cached) { applyCachedTranslation(item.textNode, item.originalText, cached); return false; }
+          // 已翻译节点跳过
+          const lastTranslated = translatedNodeTexts.get(item.textNode);
+          return !(lastTranslated !== undefined && item.textNode.textContent === lastTranslated);
+        });
+        for (const item of filteredItems) {
+          if (!pendingNewNodes.some(p => p.textNode === item.textNode)) {
+            pendingNewNodes.push(item);
+          }
+        }
       }
     }
 
@@ -198,9 +220,10 @@ async function flushPendingTranslation(): Promise<void> {
           for (let j = 0; j < batch.length; j++) {
             if (typeof response.translatedTexts[j] === 'string') {
               // 保存原文用于恢复
-              originalTexts.push({ node: batch[j].textNode, text: batch[j].originalText });
+              saveOriginalText(batch[j].textNode, batch[j].originalText);
               batch[j].textNode.textContent = response.translatedTexts[j];
-              translatedNodes.add(batch[j].textNode);
+              translatedNodeTexts.set(batch[j].textNode, response.translatedTexts[j]);
+              textTranslationCache.set(batch[j].originalText, response.translatedTexts[j]);
             }
           }
         }
@@ -229,7 +252,7 @@ function stopMutationObserver(): void {
     debounceTimer = null;
   }
   pendingNewNodes = [];
-  translatedNodes = new WeakSet();
+  translatedNodeTexts = new WeakMap();
   isAutoTranslating = false;
 }
 ```
@@ -257,9 +280,9 @@ mutationObserver.observe(document.body, {
 
 | 场景 | 处理方式 |
 |---|---|
-| 用户快速滚动，短时间内大量新节点加入 | 500ms 防抖，攒够一批再翻译 |
+| 用户快速滚动，短时间内大量新节点加入 | 2000ms 防抖，等新内容加载完再一次性翻译 |
 | 新增节点中包含插件自己的 UI 元素 | 通过 `id` 前缀 `ai-translate-` 过滤。所有插件注入的 Shadow DOM 宿主元素必须以此前缀命名 |
-| 同一个文本节点被重复添加（如 DOM 移动操作） | 通过 `WeakSet<Node>` 记录已翻译节点，跳过重复 |
+| 同一个文本节点被重复添加（如 DOM 移动操作） | 通过 `WeakMap<Node, string>` 记录已翻译节点和其对应译文，跳过重复 |
 | 正在翻译动态内容时又来了新内容 | `isAutoTranslating` 标志防并发。新内容进入 `pendingNewNodes` 缓冲区，当前批次完成后继续处理 |
 | SPA 路由跳转，整个页面内容替换 | 旧节点被移除，`textNode.textContent` 赋值静默失败。新页面内容作为新增节点被 Observer 捕获并翻译 |
 | 恢复原文后，用户继续滚动 | Observer 已停止，新内容不会被翻译 |

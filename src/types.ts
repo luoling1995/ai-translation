@@ -56,6 +56,7 @@ export interface TranslateSuccessResponse {
 export interface TranslateBatchSuccessResponse {
   success: true;
   translatedTexts: string[];  // 批量翻译
+  missedIndices?: number[];   // 模型丢失的项在本批次内的下标
 }
 
 export interface TranslateErrorResponse {

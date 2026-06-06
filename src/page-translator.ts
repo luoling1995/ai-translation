@@ -33,8 +33,30 @@ let debounceTimer: number | null = null;
 const DEBOUNCE_DELAY = 2000; // 2秒防抖，等新内容加载完再一次性翻译
 let isAutoTranslating = false;
 
-// 分批上限：100k token（模型上下文 200k token，留 100k 给 system prompt + 翻译响应）
-const MAX_BATCH_TOKENS = 100000;
+// 分批上限：5k token。
+// 模型最大输入 16k、最大输出 16k；按"中英 token 1:1"的最坏情况，
+// 单批输入 X + 单批输出 X + 固定开销 0.5k ≤ 16k → X ≤ 7.5k。
+// 取 5k 留出 ~34% 余量，覆盖所有真实页面（包括中英 token 接近 1:1 的术语密集页），
+// 彻底避免 finish_reason=length 截断。
+const MAX_BATCH_TOKENS = 5000;
+
+// 整页翻译并发数：3 路并行提速，避免触发 API QPS 限制
+const CONCURRENCY_LIMIT = 3;
+
+/** 通用并发执行器：限制同时运行的任务数，超出排队等待 */
+async function runWithConcurrency<T>(tasks: (() => Promise<T>)[], limit: number): Promise<T[]> {
+  const results: T[] = new Array(tasks.length);
+  let cursor = 0;
+  const workerCount = Math.min(limit, tasks.length);
+  const workers = Array.from({ length: workerCount }, async () => {
+    while (cursor < tasks.length) {
+      const idx = cursor++;
+      results[idx] = await tasks[idx]();
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
 
 // ==========================================
 // 对外接口
@@ -121,24 +143,30 @@ export async function startPageTranslation(): Promise<void> {
     updateProgress(0, total, `正在翻译... (0/${total}) - 页面较长，预计耗时约一分钟`);
   }
 
-  // 5. 逐批翻译（每批失败最多重试 2 次，共 3 次尝试）
+  // 5. 并发翻译（每批失败最多重试 2 次，共 3 次尝试；用完成数更新进度）
   const MAX_RETRY = 2;
   let hasError = false;
-  for (let i = 0; i < total; i++) {
-    if (cancelled || isContextInvalidated()) break;
+  let completed = 0;
+  // 待写入 DOM 的批次计数：setTimeout 异步写 DOM 必须在 startMutationObserver 前完成，
+  // 否则 Observer 会把刚写入的译文当作"新增节点"重新翻译
+  let pendingDomWrites = 0;
+  // 收集各批次中模型丢失的项，等全部批次完成后统一补翻译
+  const missedItems: TranslateItem[] = [];
 
-    updateProgress(i + 1, total);
+  const tasks = batches.map((batch, i) => async () => {
+    if (cancelled || isContextInvalidated()) {
+      completed++;
+      return;
+    }
 
-    const batch = batches[i];
     const texts = batch.map(item => item.originalText);
-
     let batchSuccess = false;
+
     for (let attempt = 0; attempt <= MAX_RETRY; attempt++) {
       if (cancelled || isContextInvalidated()) break;
 
       if (attempt > 0) {
         console.log(`[PageTranslator] 批次 ${i + 1} 第 ${attempt} 次重试...`);
-        updateProgress(i + 1, total, `⚠️ 批次 ${i + 1} 响应异常，正在重试（第 ${attempt}/${MAX_RETRY} 次）...`);
         await new Promise(resolve => setTimeout(resolve, 1000));
       }
 
@@ -154,18 +182,25 @@ export async function startPageTranslation(): Promise<void> {
 
         if (response.success) {
           const translated = response.translatedTexts;
-          for (let j = 0; j < batch.length; j++) {
-            if (translated[j] !== undefined) {
-              batch[j].textNode.textContent = translated[j];
-              translatedNodeTexts.set(batch[j].textNode, translated[j]);
-              textTranslationCache.set(batch[j].originalText, translated[j]);
+          // 异步写 DOM，避开 React 等框架的协调器（与 applyCachedTranslation 行为一致）
+          pendingDomWrites++;
+          setTimeout(() => {
+            for (let j = 0; j < batch.length; j++) {
+              if (translated[j] !== undefined) {
+                batch[j].textNode.textContent = translated[j];
+                translatedNodeTexts.set(batch[j].textNode, translated[j]);
+                textTranslationCache.set(batch[j].originalText, translated[j]);
+              }
+            }
+            pendingDomWrites--;
+          }, 0);
+          // 收集模型丢失的项
+          if (response.missedIndices && response.missedIndices.length > 0) {
+            for (const idx of response.missedIndices) {
+              missedItems.push(batch[idx]);
             }
           }
-          if (attempt > 0) {
-            // 重试成功，把进度条恢复为正常文案
-            updateProgress(i + 1, total);
-          }
-          console.log(`[PageTranslator] 批次 ${i + 1}/${total} 翻译成功，${batch.length} 段${attempt > 0 ? `（第 ${attempt + 1} 次尝试）` : ''}`);
+          console.log(`[PageTranslator] 批次 ${i + 1}/${total} 翻译成功，${batch.length} 段${response.missedIndices ? `（丢失 ${response.missedIndices.length} 项待补）` : ''}${attempt > 0 ? `（第 ${attempt + 1} 次尝试）` : ''}`);
           batchSuccess = true;
           break;
         } else {
@@ -180,6 +215,57 @@ export async function startPageTranslation(): Promise<void> {
     if (!batchSuccess && !cancelled && !isContextInvalidated()) {
       hasError = true;
       console.warn(`[PageTranslator] 批次 ${i + 1} 重试 ${MAX_RETRY} 次后仍失败，跳过`);
+    }
+
+    completed++;
+    if (!cancelled && !isContextInvalidated()) {
+      updateProgress(completed, total);
+    }
+  });
+
+  await runWithConcurrency(tasks, CONCURRENCY_LIMIT);
+
+  // 等待所有 setTimeout 写 DOM 完成
+  while (pendingDomWrites > 0) {
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+
+  // 6. 统一补翻译：所有批次中模型丢失的项合成一批补发
+  if (missedItems.length > 0 && !cancelled && !isContextInvalidated()) {
+    console.log(`[PageTranslator] 补翻译 ${missedItems.length} 个丢失项`);
+    try {
+      const missedTexts = missedItems.map(item => item.originalText);
+      const retryResponse: TranslateBatchResponse = await safeSendMessageToBackground({
+        action: 'translateBatch',
+        texts: missedTexts,
+        batchIndex: 0,
+        totalBatches: 1
+      });
+      if (retryResponse.success) {
+        pendingDomWrites++;
+        setTimeout(() => {
+          for (let j = 0; j < missedItems.length; j++) {
+            if (retryResponse.translatedTexts[j] !== undefined) {
+              missedItems[j].textNode.textContent = retryResponse.translatedTexts[j];
+              translatedNodeTexts.set(missedItems[j].textNode, retryResponse.translatedTexts[j]);
+              textTranslationCache.set(missedItems[j].originalText, retryResponse.translatedTexts[j]);
+            }
+          }
+          pendingDomWrites--;
+        }, 0);
+        const stillMissed = retryResponse.missedIndices?.length ?? 0;
+        console.log(`[PageTranslator] 补翻译完成，${missedItems.length - stillMissed}/${missedItems.length} 项成功`);
+      } else {
+        console.warn('[PageTranslator] 补翻译失败:', retryResponse.error);
+        hasError = true;
+      }
+    } catch (e) {
+      console.warn('[PageTranslator] 补翻译异常:', e);
+      hasError = true;
+    }
+    // 等待补翻译的 DOM 写入完成
+    while (pendingDomWrites > 0) {
+      await new Promise(resolve => setTimeout(resolve, 10));
     }
   }
 
@@ -529,9 +615,8 @@ async function flushPendingTranslation(): Promise<void> {
     showAutoTranslateStatus(itemsToTranslate.length);
 
     const batches = splitIntoBatches(itemsToTranslate);
-    for (let i = 0; i < batches.length; i++) {
-      const batch = batches[i];
-      if (!mutationObserver || isContextInvalidated()) break;
+    const tasks = batches.map((batch, i) => async () => {
+      if (!mutationObserver || isContextInvalidated()) return;
 
       try {
         const texts = batch.map(item => item.originalText);
@@ -542,7 +627,7 @@ async function flushPendingTranslation(): Promise<void> {
           totalBatches: batches.length
         });
 
-        if (!mutationObserver || isContextInvalidated()) break;
+        if (!mutationObserver || isContextInvalidated()) return;
 
         if (response.success) {
           for (let j = 0; j < batch.length; j++) {
@@ -559,9 +644,9 @@ async function flushPendingTranslation(): Promise<void> {
         }
       } catch (e) {
         console.warn('[PageTranslator] 动态翻译单批失败:', e);
-        if (isContextInvalidated()) break;
       }
-    }
+    });
+    await runWithConcurrency(tasks, CONCURRENCY_LIMIT);
   } finally {
     isAutoTranslating = false;
     // 恢复进度条为完成状态

@@ -15,7 +15,7 @@
 - `src/background.ts`：MV3 service worker、MiniMax API 适配、右键菜单、与 tab 通信。
 - `src/content.ts`：内容脚本入口，负责划词翻译 UI、消息分发，并调用整页翻译模块。
 - `src/popup.ts`：popup 入口，负责 API Key/模型名存储、连接测试、翻译当前页和恢复原文按钮。
-- `src/page-translator.ts`：整页文本收集、分批翻译、原文恢复、MutationObserver 动态翻译；避免在新增循环里逐节点发 HTTP。
+- `src/page-translator.ts`：整页文本收集、token 估算分批、3 路并发翻译、译文缓存、丢项补翻译、溢出修复、原文恢复、MutationObserver 动态翻译；避免在新增循环里逐节点发 HTTP。
 - `src/progress-ui.ts` 和内容脚本注入 UI 都依赖 closed Shadow DOM；宿主元素 id 保持 `ai-translate-` 前缀，供自身 DOM 过滤使用。
 - `src/messaging.ts` 集中处理 `chrome.runtime.lastError` 和扩展上下文失效；新增跨脚本通信时优先复用这里的安全发送逻辑。
 
@@ -25,5 +25,5 @@
 - 运行时脚本必须是无模块 IIFE；不要让编译产物保留运行时 `import` / `export`。`src/types.ts` 只作为类型来源导入。
 
 ## 验证
-- 改 TypeScript 后至少跑 `npm run typecheck`；改入口、消息协议、manifest 或静态扩展文件后跑 `npm run build`。
+- 改动任何代码都必须跑 `npm run build`（已包含 `typecheck` + 三个入口的 esbuild 打包）。
 - 发布或功能验证按 `chrome-translate-plugin-spec/08-validation-and-roadmap.md`，并在 Chrome 中加载 `dist/` 手工验证受影响流程。

@@ -8,7 +8,8 @@
 - 划词后在选区附近显示翻译按钮，点击后在页面浮窗展示译文。
 - 右键菜单支持“翻译选中文本”和“翻译整个页面”。
 - Popup 支持保存 MiniMax API Key、配置模型名、测试连接、触发整页翻译和恢复原文。
-- 整页翻译按批次请求，避免逐节点调用 HTTP；翻译完成后可继续监听并翻译动态加载内容。
+- 整页翻译按 token 估算分批（单批 ≤ 5000 token），3 路并发请求提速，并对模型丢失的项进行补翻译。
+- 内置内存缓存，相同内容不重复请求 API；翻译完成后可继续监听并翻译动态加载内容。
 - 内容脚本注入 UI 使用 closed Shadow DOM 隔离样式，减少宿主页面 CSS 影响。
 
 ## 安装与加载
@@ -41,7 +42,7 @@ Chrome 受限页面（如 `chrome://`、Chrome Web Store、扩展页面）通常
 - `src/background.ts`：MV3 service worker、MiniMax API 适配、右键菜单、与 tab 通信。
 - `src/content.ts`：内容脚本入口，负责划词翻译 UI、消息分发，并调用整页翻译模块。
 - `src/popup.ts`：Popup 入口，负责 API Key/模型名存储、连接测试、翻译当前页和恢复原文按钮。
-- `src/page-translator.ts`：整页文本收集、分批翻译、原文恢复、MutationObserver 动态翻译。
+- `src/page-translator.ts`：整页文本收集、token 估算分批、并发翻译、翻译缓存、补翻译、溢出容器修复、原文恢复、MutationObserver 动态翻译。
 - `src/progress-ui.ts`：整页翻译进度条 UI。
 - `src/messaging.ts`：安全消息发送、`chrome.runtime.lastError` 和扩展上下文失效处理。
 - `src/types.ts`：消息协议、API 响应、存储结构等共享类型。

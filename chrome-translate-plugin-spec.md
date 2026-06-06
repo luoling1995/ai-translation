@@ -1,6 +1,6 @@
 # Chrome 大模型翻译插件规格总览
 
-> 版本：v1.3 | 日期：2026-06-03
+> 版本：v1.4 | 日期：2026-06-06
 
 > 本文件是 AI 和开发者的入口导航。具体规格已经拆分到 `chrome-translate-plugin-spec/` 目录。
 >
@@ -63,6 +63,7 @@
 | T06 | Popup API Key、模型名、测试连接、翻译当前页、恢复原文 | 已完成 | [04](chrome-translate-plugin-spec/04-popup-language-errors.md)、[06](chrome-translate-plugin-spec/06-message-protocol-and-api.md)、[07](chrome-translate-plugin-spec/07-ui-visual-spec.md) | 2026-06-04 | 编写高颜值选项页 HTML/CSS，实现本地存储读写、受限页面保护检测、10s 超时测试连接和页面操作派发 |
 | T07 | 统一错误处理、Chrome 受限页面、请求超时和异常兜底 | 已完成 | [02](chrome-translate-plugin-spec/02-selection-and-context-menu.md)、[03](chrome-translate-plugin-spec/03-page-translation.md)、[04](chrome-translate-plugin-spec/04-popup-language-errors.md)、[06](chrome-translate-plugin-spec/06-message-protocol-and-api.md) | 2026-06-04 | 修正并对齐 API 所有错误中文响应提示，完善全链路对受限页面 (chrome:// 等) 通信崩溃的防护 |
 | T08 | 全量验证、构建产物检查、手工测试和发布前整理 | 已完成 | [01](chrome-translate-plugin-spec/01-project-overview.md)、[05](chrome-translate-plugin-spec/05-build-manifest-and-ui-isolation.md)、[08](chrome-translate-plugin-spec/08-validation-and-roadmap.md) | 2026-06-04 | 终期全量 tsc 类型检查通过，esbuild 打包无误，生成物完全符合无 module runtime 注入规范 |
+| T09 | 分批策略优化、并发翻译、翻译缓存、补翻译、溢出修复 | 已完成 | [03](chrome-translate-plugin-spec/03-page-translation.md)、[06](chrome-translate-plugin-spec/06-message-protocol-and-api.md)、[08](chrome-translate-plugin-spec/08-validation-and-roadmap.md) | 2026-06-06 | 改用 token 估算分批（上限 5000）替代字符数分批；3 路并发提速；分隔符方案替代 JSON 数组防错位；并发重试+补翻译消除丢项；内存翻译缓存；溢出容器修复；监听死节点释放内存 |
 
 ---
 
@@ -87,3 +88,4 @@
 ## 六、当前拆分记录
 
 - 2026-06-03：从单文件规格拆分为 8 个子文档，并将原文件改为 AI 导航和任务状态总览。
+- 2026-06-06：同步实际代码改动至规格（v1.4）：token 估算分批、三路并发、⟪N#⟫ 分隔符方案、missedIndices 补翻译、翻译缓存、溢出修复、双 Endpoint 回退、120s 超时、防抖 2000ms。
