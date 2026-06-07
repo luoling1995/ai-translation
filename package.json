@@ -1,5 +1,5 @@
 {
-  "name": "ai-translation-gemini",
+  "name": "ai-translation",
   "version": "1.0.0",
   "description": "Chrome 大模型翻译插件",
   "scripts": {
