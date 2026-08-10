@@ -33,12 +33,11 @@ let debounceTimer: number | null = null;
 const DEBOUNCE_DELAY = 2000; // 2秒防抖，等新内容加载完再一次性翻译
 let isAutoTranslating = false;
 
-// 分批上限：5k token。
-// 模型最大输入 16k、最大输出 16k；按"中英 token 1:1"的最坏情况，
-// 单批输入 X + 单批输出 X + 固定开销 0.5k ≤ 16k → X ≤ 7.5k。
-// 取 5k 留出 ~34% 余量，覆盖所有真实页面（包括中英 token 接近 1:1 的术语密集页），
-// 彻底避免 finish_reason=length 截断。
-const MAX_BATCH_TOKENS = 5000;
+// 控制单次生成长度，避免长译文超过 120 秒请求上限。
+// 较小批次还能让普通长文充分利用 3 路并发，降低首批译文等待时间。
+const MAX_BATCH_TOKENS = 1500;
+// 随机分隔符约占 8 token，短文本密集页面必须计入批次预算
+const BATCH_MARKER_TOKENS = 8;
 
 // 整页翻译并发数：3 路并行提速，避免触发 API QPS 限制
 const CONCURRENCY_LIMIT = 3;
@@ -96,16 +95,18 @@ export async function startPageTranslation(): Promise<void> {
   // 2. 优先从缓存应用，剩余的走 API
   originalTexts = [];
   const itemsToTranslate: TranslateItem[] = [];
+  const cacheWrites: Promise<void>[] = [];
 
   for (const item of items) {
-    saveOriginalText(item.textNode, item.originalText);
     const cached = textTranslationCache.get(item.originalText);
     if (cached) {
-      applyCachedTranslation(item.textNode, item.originalText, cached);
+      cacheWrites.push(applyCachedTranslation(item.textNode, item.originalText, cached));
     } else {
       itemsToTranslate.push(item);
     }
   }
+
+  await Promise.all(cacheWrites);
 
   const cacheHitCount = items.length - itemsToTranslate.length;
   if (cacheHitCount > 0) {
@@ -123,6 +124,7 @@ export async function startPageTranslation(): Promise<void> {
     updateProgress(1, 1, '✓ 翻译完成（已使用本地缓存）');
     isPageTranslating = false;
     isPageTranslated = true;
+    fixOverflowContainers();
     startMutationObserver();
     return;
   }
@@ -161,13 +163,15 @@ export async function startPageTranslation(): Promise<void> {
 
     const texts = batch.map(item => item.originalText);
     let batchSuccess = false;
+    let retryDelay = 1000;
 
     for (let attempt = 0; attempt <= MAX_RETRY; attempt++) {
       if (cancelled || isContextInvalidated()) break;
 
       if (attempt > 0) {
         console.log(`[PageTranslator] 批次 ${i + 1} 第 ${attempt} 次重试...`);
-        await new Promise(resolve => setTimeout(resolve, 1000));
+        await new Promise(resolve => setTimeout(resolve, retryDelay));
+        if (cancelled || isContextInvalidated()) break;
       }
 
       try {
@@ -182,15 +186,15 @@ export async function startPageTranslation(): Promise<void> {
 
         if (response.success) {
           const translated = response.translatedTexts;
+          const missedSet = new Set(response.missedIndices ?? []);
           // 异步写 DOM，避开 React 等框架的协调器（与 applyCachedTranslation 行为一致）
           pendingDomWrites++;
           setTimeout(() => {
             for (let j = 0; j < batch.length; j++) {
-              if (translated[j] !== undefined) {
-                batch[j].textNode.textContent = translated[j];
-                translatedNodeTexts.set(batch[j].textNode, translated[j]);
-                textTranslationCache.set(batch[j].originalText, translated[j]);
-              }
+              const translatedText = translated[j];
+              if (missedSet.has(j) || typeof translatedText !== 'string') continue;
+              textTranslationCache.set(batch[j].originalText, translatedText);
+              applyTranslationIfCurrent(batch[j], translatedText);
             }
             pendingDomWrites--;
           }, 0);
@@ -205,6 +209,7 @@ export async function startPageTranslation(): Promise<void> {
           break;
         } else {
           console.warn(`[PageTranslator] 批次 ${i + 1} 第 ${attempt + 1} 次尝试失败:`, response.error);
+          retryDelay = response.error.includes('服务繁忙') ? 5000 * (attempt + 1) : 1000 * (attempt + 1);
         }
       } catch (e) {
         console.error(`[PageTranslator] 批次 ${i + 1} 第 ${attempt + 1} 次尝试异常:`, e);
@@ -230,39 +235,41 @@ export async function startPageTranslation(): Promise<void> {
     await new Promise(resolve => setTimeout(resolve, 10));
   }
 
-  // 6. 统一补翻译：所有批次中模型丢失的项合成一批补发
+  // 6. 统一补翻译：重新分批，避免合并后的请求突破单批上限
   if (missedItems.length > 0 && !cancelled && !isContextInvalidated()) {
     console.log(`[PageTranslator] 补翻译 ${missedItems.length} 个丢失项`);
-    try {
-      const missedTexts = missedItems.map(item => item.originalText);
-      const retryResponse: TranslateBatchResponse = await safeSendMessageToBackground({
-        action: 'translateBatch',
-        texts: missedTexts,
-        batchIndex: 0,
-        totalBatches: 1
-      });
-      if (retryResponse.success) {
-        pendingDomWrites++;
-        setTimeout(() => {
-          for (let j = 0; j < missedItems.length; j++) {
-            if (retryResponse.translatedTexts[j] !== undefined) {
-              missedItems[j].textNode.textContent = retryResponse.translatedTexts[j];
-              translatedNodeTexts.set(missedItems[j].textNode, retryResponse.translatedTexts[j]);
-              textTranslationCache.set(missedItems[j].originalText, retryResponse.translatedTexts[j]);
-            }
-          }
-          pendingDomWrites--;
-        }, 0);
-        const stillMissed = retryResponse.missedIndices?.length ?? 0;
-        console.log(`[PageTranslator] 补翻译完成，${missedItems.length - stillMissed}/${missedItems.length} 项成功`);
-      } else {
-        console.warn('[PageTranslator] 补翻译失败:', retryResponse.error);
+    const retryBatches = splitIntoBatches(missedItems);
+    const retryTasks = retryBatches.map((batch, i) => async () => {
+      if (cancelled || isContextInvalidated()) return;
+      try {
+        const retryResponse: TranslateBatchResponse = await safeSendMessageToBackground({
+          action: 'translateBatch',
+          texts: batch.map(item => item.originalText),
+          batchIndex: i,
+          totalBatches: retryBatches.length
+        });
+        if (cancelled || isContextInvalidated()) return;
+        if (!retryResponse.success) {
+          console.warn('[PageTranslator] 补翻译失败:', retryResponse.error);
+          hasError = true;
+          return;
+        }
+
+        const stillMissed = new Set(retryResponse.missedIndices ?? []);
+        for (let j = 0; j < batch.length; j++) {
+          const translatedText = retryResponse.translatedTexts[j];
+          if (stillMissed.has(j) || typeof translatedText !== 'string') continue;
+          textTranslationCache.set(batch[j].originalText, translatedText);
+          applyTranslationIfCurrent(batch[j], translatedText);
+        }
+        if (stillMissed.size > 0) hasError = true;
+        console.log(`[PageTranslator] 补翻译批次完成，${batch.length - stillMissed.size}/${batch.length} 项成功`);
+      } catch (e) {
+        console.warn('[PageTranslator] 补翻译异常:', e);
         hasError = true;
       }
-    } catch (e) {
-      console.warn('[PageTranslator] 补翻译异常:', e);
-      hasError = true;
-    }
+    });
+    await runWithConcurrency(retryTasks, CONCURRENCY_LIMIT);
     // 等待补翻译的 DOM 写入完成
     while (pendingDomWrites > 0) {
       await new Promise(resolve => setTimeout(resolve, 10));
@@ -270,6 +277,8 @@ export async function startPageTranslation(): Promise<void> {
   }
 
   isPageTranslating = false;
+
+  if (isContextInvalidated()) return;
 
   if (cancelled) {
     console.log('[PageTranslator] 翻译已被用户取消');
@@ -288,10 +297,14 @@ export async function startPageTranslation(): Promise<void> {
 /** 恢复网页原文 */
 export function restoreOriginalText(): void {
   console.log('[PageTranslator] 恢复原文，共', originalTexts.length, '个节点');
+  const translatedTexts = translatedNodeTexts;
   stopMutationObserver();
 
   for (const item of originalTexts) {
-    item.node.textContent = item.text;
+    const translatedText = translatedTexts.get(item.node);
+    if (translatedText !== undefined && item.node.textContent === translatedText) {
+      item.node.textContent = item.text;
+    }
   }
 
   // 还原被修改的容器 height 样式
@@ -349,6 +362,7 @@ export function collectTextNodesFromElement(element: Node, skipVisibilityCheck =
 
       if (EXCLUDED_TAGS.has(tagName)) return;
       if (el.id?.startsWith('ai-translate-')) return;
+      if (el.getAttribute('aria-hidden') === 'true') return;
 
       if (!skipVisibilityCheck) {
         const style = window.getComputedStyle(el);
@@ -359,6 +373,7 @@ export function collectTextNodesFromElement(element: Node, skipVisibilityCheck =
     }
 
     if (node.nodeType === Node.TEXT_NODE) {
+      if (hasExcludedAncestor(node)) return;
       const text = node.textContent || '';
       const trimmed = text.trim();
 
@@ -387,6 +402,19 @@ export function collectTextNodesFromElement(element: Node, skipVisibilityCheck =
 
   walk(element);
   return items;
+}
+
+/** 动态新增节点可能直接从文本节点开始遍历，因此必须检查完整祖先链。 */
+function hasExcludedAncestor(node: Node): boolean {
+  let parent = node.parentElement;
+  while (parent) {
+    if (EXCLUDED_TAGS.has(parent.tagName.toLowerCase())) return true;
+    if (parent.id?.startsWith('ai-translate-')) return true;
+    if (parent.getAttribute('aria-hidden') === 'true') return true;
+    if (parent.isContentEditable) return true;
+    parent = parent.parentElement;
+  }
+  return false;
 }
 
 /**
@@ -422,7 +450,7 @@ function splitIntoBatches(items: TranslateItem[]): TranslateItem[][] {
   let currentTokens = 0;
 
   for (const item of items) {
-    const itemTokens = estimateTokens(item.originalText);
+    const itemTokens = estimateTokens(item.originalText) + BATCH_MARKER_TOKENS;
 
     if (currentBatch.length > 0 && currentTokens + itemTokens > MAX_BATCH_TOKENS) {
       batches.push(currentBatch);
@@ -467,7 +495,13 @@ function fixOverflowContainers(): void {
 
       const style = window.getComputedStyle(el);
       // 仅处理 overflow:hidden 且 height 被显式固定（不是 auto）的元素
-      if (style.overflow === 'hidden' || style.overflowY === 'hidden') {
+      if ((style.overflow === 'hidden' || style.overflowY === 'hidden') && el.scrollHeight > el.clientHeight + 1) {
+        // CSS 行数截断是页面的明确设计，不应主动展开
+        if (style.webkitLineClamp && style.webkitLineClamp !== 'none') {
+          node = node.parentNode;
+          depth++;
+          continue;
+        }
         const inlineHeight = el.style.height;
         const computedHeight = style.height;
         // 只修改有固定像素高度的元素（排除 auto、0px、空字符串）
@@ -504,12 +538,29 @@ function saveOriginalText(node: Node, text: string): void {
 }
 
 /** 异步应用缓存译文，防止在 MutationObserver 回调中同步修改 DOM 干扰 React 协调器 */
-function applyCachedTranslation(node: Node, originalText: string, cachedText: string): void {
-  setTimeout(() => {
-    saveOriginalText(node, originalText);
-    node.textContent = cachedText;
-    translatedNodeTexts.set(node, cachedText);
-  }, 0);
+function applyCachedTranslation(
+  node: Node,
+  originalText: string,
+  cachedText: string,
+  expectedObserver?: MutationObserver
+): Promise<void> {
+  return new Promise(resolve => setTimeout(() => {
+    if (expectedObserver && mutationObserver !== expectedObserver) {
+      resolve();
+      return;
+    }
+    applyTranslationIfCurrent({ textNode: node, originalText, parentTag: '' }, cachedText);
+    resolve();
+  }, 0));
+}
+
+/** 仅在节点仍对应请求时原文时回填，避免旧请求覆盖 SPA 的新内容。 */
+function applyTranslationIfCurrent(item: TranslateItem, translatedText: string): boolean {
+  if (!item.textNode.isConnected || item.textNode.textContent !== item.originalText) return false;
+  saveOriginalText(item.textNode, item.originalText);
+  item.textNode.textContent = translatedText;
+  translatedNodeTexts.set(item.textNode, translatedText);
+  return true;
 }
 
 /** 释放已移除节点的强引用，防止内存泄漏 */
@@ -551,7 +602,7 @@ function startMutationObserver(): void {
 
       // 处理节点移除，释放内存
       for (const removedNode of mutation.removedNodes) {
-        cleanOriginalTextsForRemovedNode(removedNode);
+        if (!removedNode.isConnected) cleanOriginalTextsForRemovedNode(removedNode);
       }
 
       // 处理新增节点
@@ -564,7 +615,7 @@ function startMutationObserver(): void {
           // 缓存命中直接应用，不走 API
           const cached = textTranslationCache.get(item.originalText);
           if (cached) {
-            applyCachedTranslation(item.textNode, item.originalText, cached);
+            void applyCachedTranslation(item.textNode, item.originalText, cached, mutationObserver ?? undefined);
             return false;
           }
           // 已翻译的节点跳过
@@ -604,6 +655,7 @@ async function flushPendingTranslation(): Promise<void> {
   if (pendingNewNodes.length === 0 || isAutoTranslating) return;
 
   isAutoTranslating = true;
+  const activeObserver = mutationObserver;
 
   try {
     const itemsToTranslate = [...pendingNewNodes];
@@ -616,7 +668,7 @@ async function flushPendingTranslation(): Promise<void> {
 
     const batches = splitIntoBatches(itemsToTranslate);
     const tasks = batches.map((batch, i) => async () => {
-      if (!mutationObserver || isContextInvalidated()) return;
+      if (!activeObserver || mutationObserver !== activeObserver || isContextInvalidated()) return;
 
       try {
         const texts = batch.map(item => item.originalText);
@@ -627,16 +679,15 @@ async function flushPendingTranslation(): Promise<void> {
           totalBatches: batches.length
         });
 
-        if (!mutationObserver || isContextInvalidated()) return;
+        if (mutationObserver !== activeObserver || isContextInvalidated()) return;
 
         if (response.success) {
+          const missedSet = new Set(response.missedIndices ?? []);
           for (let j = 0; j < batch.length; j++) {
-            if (typeof response.translatedTexts[j] === 'string') {
-              saveOriginalText(batch[j].textNode, batch[j].originalText);
-              batch[j].textNode.textContent = response.translatedTexts[j];
-              translatedNodeTexts.set(batch[j].textNode, response.translatedTexts[j]);
-              textTranslationCache.set(batch[j].originalText, response.translatedTexts[j]);
-            }
+            const translatedText = response.translatedTexts[j];
+            if (missedSet.has(j) || typeof translatedText !== 'string') continue;
+            textTranslationCache.set(batch[j].originalText, translatedText);
+            applyTranslationIfCurrent(batch[j], translatedText);
           }
           console.log('[PageTranslator] 自动翻译批次完成，', batch.length, '段');
         } else {
@@ -648,13 +699,14 @@ async function flushPendingTranslation(): Promise<void> {
     });
     await runWithConcurrency(tasks, CONCURRENCY_LIMIT);
   } finally {
-    isAutoTranslating = false;
-    // 恢复进度条为完成状态
-    finishProgress(false);
+    if (mutationObserver === activeObserver) {
+      isAutoTranslating = false;
+      finishProgress(false);
+    }
   }
 
   // 翻译期间可能又积累了新内容，通过防抖继续处理
-  if (pendingNewNodes.length > 0 && debounceTimer === null) {
+  if (mutationObserver === activeObserver && pendingNewNodes.length > 0 && debounceTimer === null) {
     debounceTimer = window.setTimeout(() => {
       debounceTimer = null;
       void flushPendingTranslation();

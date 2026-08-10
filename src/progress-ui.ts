@@ -18,6 +18,7 @@ export interface ProgressCallbacks {
 
 let progressShadow: ShadowRoot | null = null;
 let progressCallbacks: ProgressCallbacks | null = null;
+let autoRemoveTimer: number | null = null;
 
 /** 创建并显示进度条 */
 export function showProgressUI(callbacks: ProgressCallbacks): void {
@@ -176,11 +177,15 @@ export function showNoContentMessage(): void {
   if (spinnerEl) spinnerEl.classList.remove('active');
   if (btnEl) btnEl.style.display = 'none';
 
-  setTimeout(() => removeProgressUI(), 3000);
+  autoRemoveTimer = window.setTimeout(() => removeProgressUI(), 3000);
 }
 
 /** 移除进度条 */
 export function removeProgressUI(): void {
+  if (autoRemoveTimer !== null) {
+    clearTimeout(autoRemoveTimer);
+    autoRemoveTimer = null;
+  }
   const host = document.getElementById(PROGRESS_HOST_ID);
   if (host) host.remove();
   progressShadow = null;

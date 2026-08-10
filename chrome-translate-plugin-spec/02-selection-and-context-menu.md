@@ -1,6 +1,6 @@
 # 划词翻译与右键菜单
 
-> 版本：v1.3 | 日期：2026-06-03
+> 版本：v1.5 | 日期：2026-08-10
 
 > 返回总览：[chrome-translate-plugin-spec.md](../chrome-translate-plugin-spec.md)
 >
@@ -58,6 +58,8 @@
 | 页面滚动时浮窗位置 | 浮窗使用 `position: fixed`，滚动时保持在视口中的相对位置不变 |
 | 在 input/textarea 中选中文本 | 正常处理，但不能依赖 `window.getSelection()`；需要从目标元素的 `selectionStart` / `selectionEnd` 读取选中文本 |
 | 在 contenteditable 中选中文本 | 正常处理，可使用 `window.getSelection()` |
+
+普通划词翻译和右键菜单翻译都必须为当前浮窗记录请求 ID。浮窗关闭或新请求开始时立即使旧 ID 失效，旧响应不得重建或覆盖当前浮窗。
 
 ### 2.2 右键菜单翻译
 

@@ -1,6 +1,6 @@
 # 构建、Manifest 与样式隔离
 
-> 版本：v1.3 | 日期：2026-06-03
+> 版本：v1.5 | 日期：2026-08-10
 
 > 返回总览：[chrome-translate-plugin-spec.md](../chrome-translate-plugin-spec.md)
 >
@@ -158,6 +158,7 @@ npm run build
     "contextMenus"
   ],
   "host_permissions": [
+    "https://api.minimaxi.com/*",
     "https://api.minimax.io/*"
   ],
   "background": {

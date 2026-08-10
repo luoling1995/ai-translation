@@ -9,6 +9,7 @@
     "contextMenus"
   ],
   "host_permissions": [
+    "https://api.minimaxi.com/*",
     "https://api.minimax.io/*"
   ],
   "background": {

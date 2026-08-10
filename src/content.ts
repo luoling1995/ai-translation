@@ -14,6 +14,7 @@ const POPUP_HOST_ID = 'ai-translate-popup';
 
 // 右键菜单翻译请求 ID（校验响应归属）
 let currentRequestId = '';
+let localRequestSequence = 0;
 
 // 当前浮窗的 ShadowRoot 引用
 let currentShadow: ShadowRoot | null = null;
@@ -52,6 +53,7 @@ function cleanupUI(): void {
   const oldPopup = document.getElementById(POPUP_HOST_ID);
   if (oldPopup) oldPopup.remove();
   currentShadow = null;
+  currentRequestId = '';
 }
 
 // ==========================================
@@ -110,6 +112,8 @@ function showTranslateButton(rect: DOMRect, selectedText: string): void {
   button.addEventListener('click', async (e) => {
     e.stopPropagation();
     cleanupUI();
+    const requestId = `selection-${++localRequestSequence}`;
+    currentRequestId = requestId;
     showTranslationPopup(rect, selectedText, 'loading');
 
     const msg: ContentToBackgroundMessage = {
@@ -118,6 +122,7 @@ function showTranslateButton(rect: DOMRect, selectedText: string): void {
     };
 
     const response = await safeSendMessageToBackground(msg);
+    if (currentRequestId !== requestId) return;
     updatePopupContent(selectedText, response);
   });
 
@@ -469,8 +474,8 @@ chrome.runtime.onMessage.addListener((
   if (message.action === 'showTranslation') {
     const { requestId, state, originalText, translatedText, error } = message;
     if (state === 'loading') {
-      currentRequestId = requestId;
       cleanupUI();
+      currentRequestId = requestId;
       showTranslationPopup(null, originalText, 'loading', undefined, undefined, true);
     } else {
       if (currentRequestId === requestId) {

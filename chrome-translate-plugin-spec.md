@@ -1,6 +1,6 @@
 # Chrome 大模型翻译插件规格总览
 
-> 版本：v1.4 | 日期：2026-06-06
+> 版本：v1.7 | 日期：2026-08-10
 
 > 本文件是 AI 和开发者的入口导航。具体规格已经拆分到 `chrome-translate-plugin-spec/` 目录。
 >
@@ -64,6 +64,9 @@
 | T07 | 统一错误处理、Chrome 受限页面、请求超时和异常兜底 | 已完成 | [02](chrome-translate-plugin-spec/02-selection-and-context-menu.md)、[03](chrome-translate-plugin-spec/03-page-translation.md)、[04](chrome-translate-plugin-spec/04-popup-language-errors.md)、[06](chrome-translate-plugin-spec/06-message-protocol-and-api.md) | 2026-06-04 | 修正并对齐 API 所有错误中文响应提示，完善全链路对受限页面 (chrome:// 等) 通信崩溃的防护 |
 | T08 | 全量验证、构建产物检查、手工测试和发布前整理 | 已完成 | [01](chrome-translate-plugin-spec/01-project-overview.md)、[05](chrome-translate-plugin-spec/05-build-manifest-and-ui-isolation.md)、[08](chrome-translate-plugin-spec/08-validation-and-roadmap.md) | 2026-06-04 | 终期全量 tsc 类型检查通过，esbuild 打包无误，生成物完全符合无 module runtime 注入规范 |
 | T09 | 分批策略优化、并发翻译、翻译缓存、补翻译、溢出修复 | 已完成 | [03](chrome-translate-plugin-spec/03-page-translation.md)、[06](chrome-translate-plugin-spec/06-message-protocol-and-api.md)、[08](chrome-translate-plugin-spec/08-validation-and-roadmap.md) | 2026-06-06 | 改用 token 估算分批（上限 5000）替代字符数分批；3 路并发提速；分隔符方案替代 JSON 数组防错位；并发重试+补翻译消除丢项；内存翻译缓存；溢出容器修复；监听死节点释放内存 |
+| T10 | 翻译链路竞态、漏项缓存、动态节点过滤和 API 稳定性修复 | 已完成 | [02](chrome-translate-plugin-spec/02-selection-and-context-menu.md)、[03](chrome-translate-plugin-spec/03-page-translation.md)、[04](chrome-translate-plugin-spec/04-popup-language-errors.md)、[05](chrome-translate-plugin-spec/05-build-manifest-and-ui-isolation.md)、[06](chrome-translate-plugin-spec/06-message-protocol-and-api.md)、[08](chrome-translate-plugin-spec/08-validation-and-roadmap.md) | 2026-08-10 | 修复划词响应串台、漏项污染缓存、过期 DOM 回填、动态排除规则绕过、完整请求超时、随机分隔符、国内 Endpoint 权限及进度 UI 竞态 |
+| T11 | 长文翻译超时和 529 服务繁忙处理 | 已完成 | [03](chrome-translate-plugin-spec/03-page-translation.md)、[04](chrome-translate-plugin-spec/04-popup-language-errors.md)、[06](chrome-translate-plugin-spec/06-message-protocol-and-api.md)、[08](chrome-translate-plugin-spec/08-validation-and-roadmap.md) | 2026-08-10 | 单批上限由 5000 token 调整为 1500 token，保留 3 路并发；识别 529 并使用 5 秒起步的退避重试 |
+| T12 | 动画拆词过滤和短标题翻译质量修复 | 已完成 | [03](chrome-translate-plugin-spec/03-page-translation.md)、[06](chrome-translate-plugin-spec/06-message-protocol-and-api.md)、[08](chrome-translate-plugin-spec/08-validation-and-roadmap.md) | 2026-08-10 | 跳过 aria-hidden 动画及无障碍重复文本；批量翻译结合相邻段落处理短标题和术语，避免孤立介词被机械翻成单字 |
 
 ---
 
@@ -89,3 +92,6 @@
 
 - 2026-06-03：从单文件规格拆分为 8 个子文档，并将原文件改为 AI 导航和任务状态总览。
 - 2026-06-06：同步实际代码改动至规格（v1.4）：token 估算分批、三路并发、⟪N#⟫ 分隔符方案、missedIndices 补翻译、翻译缓存、溢出修复、双 Endpoint 回退、120s 超时、防抖 2000ms。
+- 2026-08-10：完成稳定性修复（v1.5）：请求归属校验、随机批次分隔符、漏项显式 null、DOM 回填校验、动态祖先过滤和完整生命周期超时。
+- 2026-08-10：完成长文稳定性调整（v1.6）：缩短单批生成长度，增加 529 服务繁忙识别和退避重试。
+- 2026-08-10：完成网页拆词兼容（v1.7）：过滤 aria-hidden 文本，并强化短标题和术语的上下文翻译规则。

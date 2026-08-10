@@ -8,6 +8,8 @@ export interface StorageData {
 export interface TranslateMessage {
   action: 'translate';
   text: string;
+  apiKey?: string;       // Popup 测试连接时使用输入框中的临时配置
+  modelName?: string;
 }
 
 export interface TranslateBatchMessage {
@@ -55,7 +57,7 @@ export interface TranslateSuccessResponse {
 
 export interface TranslateBatchSuccessResponse {
   success: true;
-  translatedTexts: string[];  // 批量翻译
+  translatedTexts: (string | null)[];  // null 表示模型漏掉该段
   missedIndices?: number[];   // 模型丢失的项在本批次内的下标
 }
 

@@ -1,6 +1,6 @@
 # 整页翻译与动态内容翻译
 
-> 版本：v1.4 | 日期：2026-06-06
+> 版本：v1.7 | 日期：2026-08-10
 
 > 返回总览：[chrome-translate-plugin-spec.md](../chrome-translate-plugin-spec.md)
 >
@@ -35,6 +35,7 @@ noscript, iframe, svg, math, canvas, video, audio, img
 **排除的元素**（不可见元素）：
 - `display: none` 的元素及其子节点
 - `visibility: hidden` 的元素及其子节点
+- `aria-hidden="true"` 的元素及其子节点，避免翻译动画拆词和无障碍重复内容
 - `offsetParent === null` 且不是 `<body>` 或 `position: fixed` 的元素
 - `element.isContentEditable === true` 的元素及其子节点
 
@@ -50,14 +51,15 @@ noscript, iframe, svg, math, canvas, video, audio, img
 
 #### 分批策略
 
-将收集到的文本节点按 **token 估算值**分批，每批的估算 token 总数 ≤ 5000。
+将收集到的文本节点按 **token 估算值**分批，每批的估算 token 总数 ≤ 1500。
 
 估算规则（启发式，不需要实际 tokenizer）：
 - ASCII 字符（英文、数字、标点）：4 字符 ≈ 1 token
 - CJK 字符（汉、日、韩）：1 字符 ≈ 1.5 token
 - 其他 Unicode：1 字符 = 1 token
+- 每个文本段额外计入 8 token 的随机编号分隔符开销
 
-取 5000 token 上限（模型最大输入/输出各 16k，按最坏情况输入=输出留 ~34% 余量），彻底避免 `finish_reason=length` 截断。**不限制每批的段落数上限**。
+取 1500 token 上限，主要约束模型单次输出生成时间，避免长译文超过 120 秒请求上限；普通长文可拆成多个批次并通过 3 路并发执行。**不限制每批的段落数上限**。
 
 #### 翻译执行流程
 
@@ -69,18 +71,20 @@ noscript, iframe, svg, math, canvas, video, audio, img
 3. 按分批策略将 itemsToTranslate 分为 batches[]
 4. 在页面顶部插入进度条 UI（固定定位，z-index: 2147483647）
 5. 并发（CONCURRENCY_LIMIT = 3）处理所有批次，每批最多重试 2 次（共 3 次尝试）：
-   a. 用 ⟪N#⟫ 编号分隔符拼接所有文本，发送到 Service Worker
+   a. 用带随机批次标识的编号分隔符拼接所有文本，发送到 Service Worker
    b. Service Worker 调用翻译 API，模型按编号保留分隔符原样输出
-   c. Service Worker 按 ⟪N#⟫ 拆分，按编号精确回填对应 textNode，防止数组错位
+   c. Service Worker 使用每批随机标识的编号分隔符拆分，按编号精确回填对应 textNode，防止数组错位及原文冲突
    d. 模型丢失的项收集到 missedItems[]，批次本身标记为成功
    e. 更新进度条（已完成批次 / 总批次）
-6. 所有批次完成后，对 missedItems 统一发起一次补翻译请求
+6. 所有批次完成后，对 missedItems 重新按 token 上限分批补翻译
 7. 全部完成 → 执行 fixOverflowContainers() 修复 overflow:hidden 被截断的容器
 8. 进度条文字改为"翻译完成"，显示"恢复原文"按钮
 9. 启动 MutationObserver 监听新增 DOM 内容（见 §2.3.1）
 ```
 
 **翻译缓存**：每次翻译成功后，将原文→译文写入模块级 `textTranslationCache`（`Map<string, string>`）。整页翻译启动时优先命中缓存；MutationObserver 动态翻译也先查缓存，命中则直接应用，减少 API 调用。页面刷新后缓存清空（内存生命周期与 Content Script 相同）。
+
+**异步回填安全**：模型漏掉的段落必须返回 `null`，不得把原文当译文缓存。API 返回后仅当文本节点仍连接在页面中且内容仍等于请求时原文才允许回填，避免 SPA 或虚拟列表中的旧请求覆盖新内容。动态新增节点收集时必须检查完整祖先链，不能绕过排除标签和 `contenteditable` 规则。
 
 **溢出容器修复**：翻译完成后扫描所有已翻译文本节点的祖先（最多 8 层），若某祖先有 `overflow:hidden` 且 `height` 为固定像素值，则将 `height` 改为 `auto`、补设 `min-height`，防止中文译文行数更多时被裁剪。恢复原文时同步还原。
 

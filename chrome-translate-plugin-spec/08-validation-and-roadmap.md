@@ -1,6 +1,6 @@
 # 验证计划与后续迭代
 
-> 版本：v1.4 | 日期：2026-06-06
+> 版本：v1.7 | 日期：2026-08-10
 
 > 返回总览：[chrome-translate-plugin-spec.md](../chrome-translate-plugin-spec.md)
 >
@@ -55,7 +55,13 @@
 7. **边界条件验证**：
    - 未配置 API Key 时触发翻译 → 浮窗显示提示配置 Key
    - 断网时翻译 → 显示"网络连接失败"
-   - 在 Google、GitHub 等不同网站上测试划词翻译 → 浮窗样式不被页面 CSS 影响
+    - 在 Google、GitHub 等不同网站上测试划词翻译 → 浮窗样式不被页面 CSS 影响
+    - 快速连续发起两次划词翻译 → 旧响应不能覆盖新浮窗
+    - API 请求期间更新或移除文本节点 → 旧译文不能覆盖新内容
+    - 向已有 `code/style/contenteditable` 元素动态追加内容 → 不得被自动翻译
+    - 模型批量响应漏掉编号 → 原文不得写入翻译缓存，补翻译后仍漏项应显示部分失败
+    - 翻译长页面 → 单批不超过 1500 token，529 服务繁忙后退避重试，不能立即连续请求
+    - 翻译包含逐词动画的页面 → `aria-hidden` 单词碎片不得被翻译成孤立中文或破坏布局
 8. **构建验证**：
    - `npm run typecheck` 类型检查无错误
    - `npm run build` 成功生成 `dist/background.js`、`dist/content.js`、`dist/popup.js`

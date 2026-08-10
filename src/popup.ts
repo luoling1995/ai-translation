@@ -120,7 +120,12 @@ document.addEventListener('DOMContentLoaded', () => {
     }, 10000);
 
     // 向 SW 发起单条短句翻译测试
-    chrome.runtime.sendMessage({ action: 'translate', text: '请回复 ok' }, (response) => {
+    chrome.runtime.sendMessage({
+      action: 'translate',
+      text: '请回复 ok',
+      apiKey,
+      modelName: modelNameInput.value.trim() || 'MiniMax-M2.7'
+    }, (response) => {
       if (isSettled) return;
       isSettled = true;
       if (testTimeoutId !== null) {
@@ -171,6 +176,13 @@ document.addEventListener('DOMContentLoaded', () => {
     saveBtn.textContent = '正在保存...';
 
     chrome.storage.local.set({ apiKey, modelName }, () => {
+      const err = chrome.runtime.lastError;
+      if (err) {
+        saveBtn.textContent = '保存失败';
+        saveBtn.removeAttribute('disabled');
+        apiKeyError.textContent = '保存设置失败，请重试';
+        return;
+      }
       saveBtn.textContent = '✓ 保存成功';
       setTimeout(() => {
         saveBtn.removeAttribute('disabled');
